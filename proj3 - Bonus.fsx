@@ -11,6 +11,8 @@ type Message =
 | Create of string * int
 | Join of string * int
 | UpdateRouteTable of String[]
+| FixRouteTable of string[] * string *int * string * string* int
+| FixRouteTableRequest of string * int * string *string * int
 | Route of String * String * int
 | Done
 
@@ -19,6 +21,17 @@ let b = 4.0 // find 2^b
 let mutable col = (2.0**b) |> int
 let mutable actorsMap : Map<String, IActorRef> = Map.empty
 let mutable actorHops: Map<String, Double list> = Map.empty
+
+// ===== main =======
+let numNodes = fsi.CommandLineArgs.[1] |> int
+let numRequests  = fsi.CommandLineArgs.[2] |> int
+let myActorSystem = System.create "MyActorSystem" (Configuration.load ())
+let mutable nodeId = ""
+let mutable hexVal = "" 
+let idLength = Math.Log(numNodes |> float, (double(2.0**b))) |> ceil |> int
+let replicate input multiples = String.replicate input multiples // intermediate function to calculate nodeID  
+
+let mutable kNode = replicate idLength "1"
 
 let insertElement (routeTable: string[,]) (prefixLength:int) (key:string) (j:int) =
    let routeRow = prefixLength
@@ -74,17 +87,21 @@ let routeMsg (key:string) (nodeId:string) (prefixLength:byref<int>)(routeTable:s
      if isNull routeTable.[routeRow, routeCol] then
          routeCol <- 0
 
-     actorsMap.Item(routeTable.[routeRow, routeCol])  <! Route(key, src, hop + 1)
+     elif routeTable.[routeRow, routeCol] = kNode then 
+      actorsMap.Item(routeTable.[routeRow, 0]) <! FixRouteTableRequest(key, 0, kNode, src, hop)
+     
+     else actorsMap.Item(routeTable.[routeRow, routeCol]) <! Route(key, src, hop + 1)
 
 let routeRequests (numRequests:int) (listOfNodes:string list)= 
    let mutable n = 1
    let mutable count = 0
    let mutable destId = ""
+   // printfn "List: %A" listOfNodes
    while n <= numRequests do
        for srcId in listOfNodes do
            count <- count + 1
            destId <- srcId
-           while destId = srcId do
+           while destId = srcId do 
                destId <-  listOfNodes.[Random().Next listOfNodes.Length]
            let srcRef = actorsMap.Item srcId
            srcRef <! Route(destId, srcId, 0)
@@ -131,7 +148,10 @@ let nodeActor (mailBox:Actor<_>) =
                   leafSet <- leafSet.Add((i).ToString("X"))
                for i in (l+1)..(l + (col/2)) do
                   leafSet <- leafSet.Add((i).ToString("X")) 
+            // printfn "Leafset for node %i is: %A " id  leafSet
             // Leafset complete
+            kNode <- replicate idLength "1"
+            leafSet <- leafSet.Remove (kNode) 
 
          | Join(key, entryNode) -> 
             let mutable i = 0
@@ -140,13 +160,14 @@ let nodeActor (mailBox:Actor<_>) =
                while  i < key.Length &&  key.[i] = nodeId.[i] do
                   i <- i + 1
                prefixLength <- i
+               // printfn "PL: %i" prefixLength
             with 
             | :? IndexOutOfRangeException -> printfn "exception here 1 %s %s" key nodeId
 
             updateTable routeTable prefixLength key &j nodeId  //update table
 
             insertElement routeTable prefixLength key j  
-     
+
          | UpdateRouteTable (row: String[]) ->
             routeTable.[presentRow, *] <- row
             presentRow <- presentRow + 1
@@ -155,8 +176,37 @@ let nodeActor (mailBox:Actor<_>) =
              if nodeId = key then checkKey src hop
 
              elif leafSet.Contains(key) then checkKeyInLeafSet key src hop
-
+                 
              else routeMsg key nodeId &prefixLength routeTable src hop
+
+         | FixRouteTableRequest (key, index, kNode, src, hop) ->
+            let mutable i = 0
+            let mutable j = kNode
+            try 
+               while  i < key.Length &&  key.[i] = nodeId.[i] do
+                  i <- i + 1
+               prefixLength <- i
+               mailBox.Context.Sender <! FixRouteTable ((copyRow prefixLength routeTable),kNode,index, key, src, hop)
+            with 
+            | :? IndexOutOfRangeException -> printfn "exception here 1 %s %s" key nodeId
+         
+         | FixRouteTable (routeRow, kNode,index, key, src, hop) -> 
+            let mutable flag = false
+            for element in routeRow do 
+               if element = kNode then 
+                  flag <- true
+            if flag then
+               if index < key.Length then 
+                    actorsMap.Item(routeTable.[prefixLength, (index+1)]) <! FixRouteTableRequest(key, index, kNode, src, hop)
+
+               else
+                  let mutable i = 0 
+                  while  i < key.Length &&  key.[i] = nodeId.[i] do
+                     i <- i + 1
+                  prefixLength <- i
+                  mailBox.Context.Sender <! FixRouteTable ((copyRow prefixLength routeTable),kNode,index, key, src, hop)
+                  routeTable.[prefixLength,index] <- routeRow.[index]
+                  actorsMap.Item(routeTable.[prefixLength, index]) <! Route(key, src, hop + 1)
 
          | _ -> return! loop()    
       return! loop()
@@ -169,17 +219,8 @@ let printAverageHop (averageHop: list<Double> array) (totalNumberOfHops:byref<Do
    let (total:Double) = totalNumberOfHops / double(actorHops.Count) 
    printfn "Average Hop Size %f" total
 
-// ===== main =======
-let numNodes = fsi.CommandLineArgs.[1] |> int
-let numRequests  = fsi.CommandLineArgs.[2] |> int
-let myActorSystem = System.create "MyActorSystem" (Configuration.load ())
-let mutable nodeId = ""
-let mutable hexVal = "" 
-let idLength = Math.Log(numNodes |> float, (double(2.0**b))) |> ceil |> int
-
 printfn "-------------Starting Pastry--------------"
 
-let replicate input multiples = String.replicate input multiples // intermediate function to calculate nodeID  
 nodeId <- replicate (idLength - (hexVal.Length)) "0" + hexVal
 let mutable actorRef = spawn myActorSystem nodeId nodeActor
 actorRef.Tell(Create(nodeId, idLength))
@@ -187,15 +228,16 @@ actorsMap <- actorsMap.Add(nodeId, actorRef)
 
 let mutable listOfNodes : string list = []
 listOfNodes <- nodeId :: listOfNodes
-// printfn "List of nodes : %A" listOfNodes
 
 let createNodes (i:int) = 
    hexVal <- i.ToString("X")  // convert to hex
    nodeId <-  replicate (idLength - (hexVal.Length)) "0" + hexVal
+   // printfn "Hex:%s , HexLen: %i, nodeID: %s " hexVal hexVal.Length nodeId
    actorRef <- spawn myActorSystem nodeId nodeActor
    actorRef.Tell (Create(nodeId, idLength))
    actorsMap <- actorsMap.Add(nodeId, actorRef)
-   listOfNodes <- nodeId :: listOfNodes
+   if nodeId <> kNode then 
+      listOfNodes <- nodeId :: listOfNodes
 
    let firstNode = replicate idLength "0"  //string: get the actor ref of the first node; lookup the actor ref in the actors map
    let startNode = actorsMap.Item firstNode
@@ -206,6 +248,13 @@ for i in [1..numNodes - 1] do
    createNodes i
 
 printfn "Topology Built!"
+
+// Kill actor
+let killNodeRef = actorsMap.Item kNode
+Thread.Sleep 1000
+killNodeRef.Tell(PoisonPill.Instance);
+printfn "Node %s has been killed!" kNode
+
 printfn "Processing requests...Please wait..."
 
 routeRequests numRequests listOfNodes 
